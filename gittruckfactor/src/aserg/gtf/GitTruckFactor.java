@@ -380,10 +380,18 @@ public class GitTruckFactor {
 		
 		BufferedWriter writer = null;
 		int currentDay = 0;
+		int previousCommitCount = -1;
+		TFInfo previousTFInfo = null;
+		int tfCalculations = 0;
+		int cacheHits = 0;
+		
 		try {
 			if (outputFile != null) {
 				writer = new BufferedWriter(new FileWriter(outputFile));
 				LOGGER.info("Writing daily truck factor results to: " + outputFile);
+				// CSVヘッダーを書き込み
+				writer.write("Date,TF,Coverage");
+				writer.newLine();
 			}
 			
 			// 最新日から最古日まで日次で処理
@@ -399,23 +407,41 @@ public class GitTruckFactor {
 				}
 				
 				Map<String, LogCommitInfo> filteredCommits = filterCommitsByDate(allCommits, cal.getTime());
+				int currentCommitCount = filteredCommits.size();
 				
-				if (!filteredCommits.isEmpty()) {
-					DOACalculator doaCalculator = new DOACalculator(repositoryPath, repositoryName, 
-						filteredCommits.values(), files);
-					Repository repository = doaCalculator.execute();
-					
-					TruckFactor truckFactor = new PrunedGreedyTruckFactor(config.getMinPercentage());
-					TFInfo tfInfo = truckFactor.getTruckFactor(repository);
-					
-					String result = format.format(cal.getTime()) + " TF = " + tfInfo.getTf() + 
-						" (coverage = " + String.format("%.2f", tfInfo.getCoverage() * 100) + "%)";
-					
+				TFInfo tfInfo;
+				if (currentCommitCount == previousCommitCount && previousTFInfo != null) {
+					// 前回と同じコミット数なので結果を再利用
+					tfInfo = previousTFInfo;
+					cacheHits++;
+				} else {
+					// コミット数が変わったので新たに計算
+					if (!filteredCommits.isEmpty()) {
+						DOACalculator doaCalculator = new DOACalculator(repositoryPath, repositoryName, 
+							filteredCommits.values(), files);
+						Repository repository = doaCalculator.execute();
+						
+						TruckFactor truckFactor = new PrunedGreedyTruckFactor(config.getMinPercentage());
+						tfInfo = truckFactor.getTruckFactor(repository);
+						
+						previousTFInfo = tfInfo;
+						previousCommitCount = currentCommitCount;
+						tfCalculations++;
+					} else {
+						tfInfo = null;
+					}
+				}
+				
+				if (tfInfo != null) {
 					if (writer != null) {
-						writer.write(result);
+						// CSV形式でファイルに出力
+						writer.write(String.format("%s,%d,%.2f", 
+							format.format(cal.getTime()), tfInfo.getTf(), tfInfo.getCoverage() * 100));
 						writer.newLine();
 					} else {
-						System.out.println(result);
+						// コンソールにはCSV形式で出力
+						System.out.printf("%s,%d,%.2f\n", 
+							format.format(cal.getTime()), tfInfo.getTf(), tfInfo.getCoverage() * 100);
 					}
 				}
 				
@@ -424,6 +450,8 @@ public class GitTruckFactor {
 			
 			if (outputFile != null) {
 				System.out.println("\nProgress: Complete! Processed " + currentDay + " days.");
+				System.out.println("Performance: " + tfCalculations + " TF calculations, " + cacheHits + " cache hits (" + 
+					String.format("%.1f", (double)cacheHits/(tfCalculations + cacheHits)*100) + "% cache hit rate)");
 			}
 			
 		} finally {
