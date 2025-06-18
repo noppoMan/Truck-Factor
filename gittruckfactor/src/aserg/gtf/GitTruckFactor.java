@@ -3,6 +3,8 @@ package aserg.gtf;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.FileWriter;
+import java.io.BufferedWriter;
 import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Calendar;
@@ -48,10 +50,23 @@ public class GitTruckFactor {
 		
 		String repositoryPath = "";
 		String repositoryName = "";
+		boolean dailyAnalysis = false;
+		String outputFile = null;
+		
 		if (args.length>0)
 			repositoryPath = args[0];
 		if (args.length>1)
 			repositoryName = args[1];
+		
+		// Parse command line arguments
+		for (int i = 2; i < args.length; i++) {
+			if (args[i].equals("--daily")) {
+				dailyAnalysis = true;
+			} else if (args[i].equals("--output") && i + 1 < args.length) {
+				outputFile = args[i + 1];
+				i++; // Skip the next argument as it's the file path
+			}
+		}
 		
 		repositoryPath = (repositoryPath.charAt(repositoryPath.length()-1) == '/') ? repositoryPath : (repositoryPath + "/");
 		if (repositoryName.isEmpty())
@@ -91,8 +106,13 @@ public class GitTruckFactor {
 		
 		
 		try {
-			TFInfo tf = getTFInfo(repositoryPath, repositoryName, filesInfo, modulesInfo,	fileExtractor, linguistExtractor, gitLogExtractor,aliasHandler);
-			System.out.println(tf);
+			if (dailyAnalysis) {
+				printTruckFactorDaily(repositoryPath, repositoryName, filesInfo, modulesInfo,
+					fileExtractor, linguistExtractor, gitLogExtractor, aliasHandler, outputFile);
+			} else {
+				TFInfo tf = getTFInfo(repositoryPath, repositoryName, filesInfo, modulesInfo,	fileExtractor, linguistExtractor, gitLogExtractor,aliasHandler);
+				System.out.println(tf);
+			}
 		} catch (Exception e) {
 			LOGGER.error("TF calculation aborted!",e);
 		}
@@ -318,4 +338,121 @@ public class GitTruckFactor {
 				cal.add(Calendar.MONTH, -1);
 			}
 		}
+
+	private static void printTruckFactorDaily(String repositoryPath,
+			String repositoryName, Map<String, List<LineInfo>> filesInfo,
+			Map<String, List<LineInfo>> modulesInfo,
+			FileInfoExtractor fileExtractor,
+			LinguistExtractor linguistExtractor,
+			GitLogExtractor gitLogExtractor, NewAliasHandler aliasHandler, String outputFile) throws Exception {
+		
+		// 全コミットを取得
+		Map<String, LogCommitInfo> allCommits = gitLogExtractor.execute();
+		if (aliasHandler != null)
+			allCommits = aliasHandler.execute(repositoryName, allCommits);
+		
+		List<NewFileInfo> files = fileExtractor.execute();
+		files = linguistExtractor.setNotLinguist(files);
+		if(filesInfo != null && filesInfo.size()>0)
+			if(filesInfo.containsKey(repositoryName))
+				applyFilterFiles(filesInfo.get(repositoryName), files);
+		
+		if(modulesInfo != null && modulesInfo.containsKey(repositoryName))
+			setModules(modulesInfo.get(repositoryName), files);
+		
+		// 最新日と最古日を取得
+		Date latestDate = getLatestCommitDate(allCommits);
+		Date earliestDate = getEarliestCommitDate(allCommits);
+		
+		if (latestDate == null || earliestDate == null) {
+			LOGGER.warn("No valid commit dates found");
+			return;
+		}
+		
+		// 総日数を計算
+		long totalDays = (latestDate.getTime() - earliestDate.getTime()) / (24 * 60 * 60 * 1000) + 1;
+		LOGGER.info("Starting daily truck factor analysis from " + latestDate + " to " + earliestDate + " (" + totalDays + " days)");
+		
+		Calendar cal = Calendar.getInstance();
+		cal.setTime(latestDate);
+		
+		SimpleDateFormat format = new SimpleDateFormat("yyyy/MM/dd");
+		
+		BufferedWriter writer = null;
+		int currentDay = 0;
+		try {
+			if (outputFile != null) {
+				writer = new BufferedWriter(new FileWriter(outputFile));
+				LOGGER.info("Writing daily truck factor results to: " + outputFile);
+			}
+			
+			// 最新日から最古日まで日次で処理
+			while (cal.getTime().after(earliestDate) || cal.getTime().equals(earliestDate)) {
+				currentDay++;
+				double progress = (double) currentDay / totalDays * 100;
+				
+				// 進捗を表示（--outputオプションが指定された時のみ）
+				if (outputFile != null) {
+					System.out.printf("\rProgress: %d/%d days (%.1f%%) - Processing: %s", 
+						currentDay, totalDays, progress, format.format(cal.getTime()));
+					System.out.flush(); // バッファをフラッシュして即座に表示
+				}
+				
+				Map<String, LogCommitInfo> filteredCommits = filterCommitsByDate(allCommits, cal.getTime());
+				
+				if (!filteredCommits.isEmpty()) {
+					DOACalculator doaCalculator = new DOACalculator(repositoryPath, repositoryName, 
+						filteredCommits.values(), files);
+					Repository repository = doaCalculator.execute();
+					
+					TruckFactor truckFactor = new PrunedGreedyTruckFactor(config.getMinPercentage());
+					TFInfo tfInfo = truckFactor.getTruckFactor(repository);
+					
+					String result = format.format(cal.getTime()) + " TF = " + tfInfo.getTf() + 
+						" (coverage = " + String.format("%.2f", tfInfo.getCoverage() * 100) + "%)";
+					
+					if (writer != null) {
+						writer.write(result);
+						writer.newLine();
+					} else {
+						System.out.println(result);
+					}
+				}
+				
+				cal.add(Calendar.DAY_OF_MONTH, -1);
+			}
+			
+			if (outputFile != null) {
+				System.out.println("\nProgress: Complete! Processed " + currentDay + " days.");
+			}
+			
+		} finally {
+			if (writer != null) {
+				writer.close();
+				LOGGER.info("Daily truck factor analysis completed. Results saved to: " + outputFile);
+			}
+		}
+	}
+
+	private static Date getLatestCommitDate(Map<String, LogCommitInfo> commits) {
+		Date latest = null;
+		for (LogCommitInfo commit : commits.values()) {
+			Date date = commit.getAuthorDate();
+			if (date != null && (latest == null || date.after(latest))) {
+				latest = date;
+			}
+		}
+		return latest;
+	}
+
+	private static Date getEarliestCommitDate(Map<String, LogCommitInfo> commits) {
+		Date earliest = null;
+		for (LogCommitInfo commit : commits.values()) {
+			Date date = commit.getAuthorDate();
+			if (date != null && (earliest == null || date.before(earliest))) {
+				earliest = date;
+			}
+		}
+		return earliest;
+	}
 }
